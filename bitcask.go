@@ -159,9 +159,50 @@ func (b *Bitcask) Get(key []byte) ([]byte, error) {
 	return e.Value, nil
 }
 
+// get retrieves the value of the given key. If the key is not found or an/I/O
+// error occurs a null byte slice is returned along with the error.
+func (b *Bitcask) get(key []byte) (internal.Entry, error) {
+	var df data.Datafile
+
+	// 先从索引中来找
+	value, found := b.trie.Search(key)
+	if !found {
+		return internal.Entry{}, ErrKeyNotFound
+	}
+
+	// 找到了，然后根据索引的值，再来具体的文件查数据
+	item := value.(internal.Item)
+
+	if item.FileID == b.curr.FileID() {
+		df = b.curr
+	} else {
+		df = b.datafiles[item.FileID]
+	}
+	// 读数据
+	e, err := df.ReadAt(item.Offset, item.Size)
+	if err != nil {
+		return internal.Entry{}, err
+	}
+
+	// 校验是否过期，过期的话，删除
+	if e.Expiry != nil && e.Expiry.Before(time.Now().UTC()) {
+		_ = b.delete(key) // we don't care if it doesnt succeed
+		return internal.Entry{}, ErrKeyExpired
+	}
+
+	// 校验数据完整性
+	checksum := crc32.ChecksumIEEE(e.Value)
+	if checksum != e.Checksum {
+		return internal.Entry{}, ErrChecksumFailed
+	}
+
+	return e, nil
+}
+
 // Has returns true if the key exists in the database, false otherwise.
 func (b *Bitcask) Has(key []byte) bool {
 	b.mu.RLock()
+	// 从树里搜索
 	_, found := b.trie.Search(key)
 	b.mu.RUnlock()
 	return found
@@ -169,6 +210,7 @@ func (b *Bitcask) Has(key []byte) bool {
 
 // Put stores the key and value in the database.
 func (b *Bitcask) Put(key, value []byte, options ...PutOptions) error {
+	// 一堆的校验
 	if len(key) == 0 {
 		return ErrEmptyKey
 	}
@@ -187,11 +229,13 @@ func (b *Bitcask) Put(key, value []byte, options ...PutOptions) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// 首先写数据到磁盘
 	offset, n, err := b.put(key, value, feature)
 	if err != nil {
 		return err
 	}
 
+	// 刷盘
 	if b.config.Sync {
 		if err := b.curr.Sync(); err != nil {
 			return err
@@ -199,16 +243,56 @@ func (b *Bitcask) Put(key, value []byte, options ...PutOptions) error {
 	}
 
 	// in case of successful `put`, IndexUpToDate will be always be false
+	// 只有当保存索引时，才会将该值置为true
 	b.metadata.IndexUpToDate = false
 
+	// 更新索引前，先检查key是否已经存在
 	if oldItem, found := b.trie.Search(key); found {
 		b.metadata.ReclaimableSpace += oldItem.(internal.Item).Size
 	}
 
+	// 这个是索引，当前的key对应的数据存放在哪个文件、偏移量多少，占多少字节
 	item := internal.Item{FileID: b.curr.FileID(), Offset: offset, Size: n}
+	// 更新索引
 	b.trie.Insert(key, item)
 
 	return nil
+}
+
+// put inserts a new (key, value). Both key and value are valid inputs.
+func (b *Bitcask) put(key, value []byte, feature Feature) (int64, int64, error) {
+	size := b.curr.Size()
+	if size >= int64(b.config.MaxDatafileSize) {
+		err := b.curr.Close()
+		if err != nil {
+			return -1, 0, err
+		}
+
+		id := b.curr.FileID()
+
+		df, err := data.NewDatafile(b.path, id, true, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
+		if err != nil {
+			return -1, 0, err
+		}
+
+		b.datafiles[id] = df
+
+		// 新建一个文件
+		id = b.curr.FileID() + 1
+		curr, err := data.NewDatafile(b.path, id, false, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
+		if err != nil {
+			return -1, 0, err
+		}
+		b.curr = curr
+		// 保存索引
+		err = b.saveIndex()
+		if err != nil {
+			return -1, 0, err
+		}
+	}
+
+	e := internal.NewEntry(key, value, feature.Expiry)
+	return b.curr.Write(e)
 }
 
 // Delete deletes the named key.
@@ -311,76 +395,6 @@ func (b *Bitcask) Fold(f func(key []byte) error) (err error) {
 	return
 }
 
-// get retrieves the value of the given key. If the key is not found or an/I/O
-// error occurs a null byte slice is returned along with the error.
-func (b *Bitcask) get(key []byte) (internal.Entry, error) {
-	var df data.Datafile
-
-	value, found := b.trie.Search(key)
-	if !found {
-		return internal.Entry{}, ErrKeyNotFound
-	}
-
-	item := value.(internal.Item)
-
-	if item.FileID == b.curr.FileID() {
-		df = b.curr
-	} else {
-		df = b.datafiles[item.FileID]
-	}
-
-	e, err := df.ReadAt(item.Offset, item.Size)
-	if err != nil {
-		return internal.Entry{}, err
-	}
-
-	if e.Expiry != nil && e.Expiry.Before(time.Now().UTC()) {
-		_ = b.delete(key) // we don't care if it doesnt succeed
-		return internal.Entry{}, ErrKeyExpired
-	}
-
-	checksum := crc32.ChecksumIEEE(e.Value)
-	if checksum != e.Checksum {
-		return internal.Entry{}, ErrChecksumFailed
-	}
-
-	return e, nil
-}
-
-// put inserts a new (key, value). Both key and value are valid inputs.
-func (b *Bitcask) put(key, value []byte, feature Feature) (int64, int64, error) {
-	size := b.curr.Size()
-	if size >= int64(b.config.MaxDatafileSize) {
-		err := b.curr.Close()
-		if err != nil {
-			return -1, 0, err
-		}
-
-		id := b.curr.FileID()
-
-		df, err := data.NewDatafile(b.path, id, true, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
-		if err != nil {
-			return -1, 0, err
-		}
-
-		b.datafiles[id] = df
-
-		id = b.curr.FileID() + 1
-		curr, err := data.NewDatafile(b.path, id, false, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
-		if err != nil {
-			return -1, 0, err
-		}
-		b.curr = curr
-		err = b.saveIndex()
-		if err != nil {
-			return -1, 0, err
-		}
-	}
-
-	e := internal.NewEntry(key, value, feature.Expiry)
-	return b.curr.Write(e)
-}
-
 // closeCurrentFile closes current datafile and makes it read only.
 func (b *Bitcask) closeCurrentFile() error {
 	err := b.curr.Close()
@@ -408,41 +422,11 @@ func (b *Bitcask) openNewWritableFile() error {
 	return nil
 }
 
-func (b *Bitcask) Reopen() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b.reopen()
-}
-
-// reopen reloads a bitcask object with index and datafiles
-// caller of this method should take care of locking
-func (b *Bitcask) reopen() error {
-	datafiles, lastID, err := loadDatafiles(b.path, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
-	if err != nil {
-		return err
-	}
-	t, err := loadIndex(b.path, b.indexer, b.config.MaxKeySize, datafiles, lastID, b.metadata.IndexUpToDate)
-	if err != nil {
-		return err
-	}
-
-	curr, err := data.NewDatafile(b.path, lastID, false, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
-	if err != nil {
-		return err
-	}
-
-	b.trie = t
-	b.curr = curr
-	b.datafiles = datafiles
-
-	return nil
-}
-
 // Merge merges all datafiles in the database. Old keys are squashed
 // and deleted keys removes. Duplicate key/value pairs are also removed.
 // Call this function periodically to reclaim disk space.
 func (b *Bitcask) Merge() error {
+	// 给isMerging原子赋值
 	b.mu.Lock()
 	if b.isMerging {
 		b.mu.Unlock()
@@ -453,22 +437,29 @@ func (b *Bitcask) Merge() error {
 	defer func() {
 		b.isMerging = false
 	}()
+
 	b.mu.RLock()
 	err := b.closeCurrentFile()
 	if err != nil {
 		b.mu.RUnlock()
 		return err
 	}
+
+	// 开始准备合并
 	filesToMerge := make([]int, 0, len(b.datafiles))
+	// 记录了fd
 	for k := range b.datafiles {
 		filesToMerge = append(filesToMerge, k)
 	}
+	// 打开个新文件用来写数据
 	err = b.openNewWritableFile()
 	if err != nil {
 		b.mu.RUnlock()
 		return err
 	}
 	b.mu.RUnlock()
+
+	// 排序
 	sort.Ints(filesToMerge)
 
 	// Temporary merged database path
@@ -478,6 +469,7 @@ func (b *Bitcask) Merge() error {
 	}
 	defer os.RemoveAll(temp)
 
+	// 打开一个新的db
 	// Create a merged database
 	mdb, err := Open(temp, withConfig(b.config))
 	if err != nil {
@@ -488,11 +480,13 @@ func (b *Bitcask) Merge() error {
 	// Doing this automatically strips deleted keys and
 	// old key/value pairs
 	err = b.Fold(func(key []byte) error {
+		// 索引是最新的，可能会存在新写入的数据不再合并的数据中的情况
 		item, _ := b.trie.Search(key)
 		// if key was updated after start of merge operation, nothing to do
 		if item.(internal.Item).FileID > filesToMerge[len(filesToMerge)-1] {
 			return nil
 		}
+		// 过期的数据就会删除掉
 		e, err := b.get(key)
 		if err != nil {
 			return err
@@ -502,7 +496,7 @@ func (b *Bitcask) Merge() error {
 		if e.Expiry != nil {
 			opts = append(opts, WithExpiry(*(e.Expiry)))
 		}
-
+		// 重新插进去 ，会写入到信息的文件中
 		if err := mdb.Put(key, e.Value, opts...); err != nil {
 			return err
 		}
@@ -515,6 +509,7 @@ func (b *Bitcask) Merge() error {
 	if err = mdb.Close(); err != nil {
 		return err
 	}
+
 	// no reads and writes till we reopen
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -527,6 +522,7 @@ func (b *Bitcask) Merge() error {
 	if err != nil {
 		return err
 	}
+	// 把原来的文件移除掉
 	for _, file := range files {
 		if file.IsDir() || file.Name() == lockfile {
 			continue
@@ -536,6 +532,7 @@ func (b *Bitcask) Merge() error {
 			return err
 		}
 		// if datafile was created after start of merge, skip
+		// 合并后的文件，跳过不处理
 		if len(ids) > 0 && ids[0] > filesToMerge[len(filesToMerge)-1] {
 			continue
 		}
@@ -545,6 +542,7 @@ func (b *Bitcask) Merge() error {
 		}
 	}
 
+	// 再把合并后的文件重命名，最后得到新打开数据库
 	// Rename all merged data files
 	files, err = ioutil.ReadDir(mdb.path)
 	if err != nil {
@@ -575,6 +573,7 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 		meta *metadata.MetaData
 	)
 
+	// 加载配置
 	configPath := filepath.Join(path, "config.json")
 	if internal.Exists(configPath) {
 		cfg, err = config.Load(configPath)
@@ -599,6 +598,7 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 		return nil, err
 	}
 
+	// 加载元信息
 	meta, err = loadMetadata(path)
 	if err != nil {
 		return nil, err
@@ -631,11 +631,44 @@ func Open(path string, options ...Option) (*Bitcask, error) {
 			return nil, fmt.Errorf("recovering database: %s", err)
 		}
 	}
+
 	if err := bitcask.Reopen(); err != nil {
 		return nil, err
 	}
 
 	return bitcask, nil
+}
+
+func (b *Bitcask) Reopen() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.reopen()
+}
+
+// reopen reloads a bitcask object with index and datafiles
+// caller of this method should take care of locking
+func (b *Bitcask) reopen() error {
+	datafiles, lastID, err := loadDatafiles(b.path, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
+	if err != nil {
+		return err
+	}
+	t, err := loadIndex(b.path, b.indexer, b.config.MaxKeySize, datafiles, lastID, b.metadata.IndexUpToDate)
+	if err != nil {
+		return err
+	}
+
+	// 打开最后一个文件，用作写数据
+	curr, err := data.NewDatafile(b.path, lastID, false, b.config.MaxKeySize, b.config.MaxValueSize, b.config.FileFileModeBeforeUmask)
+	if err != nil {
+		return err
+	}
+
+	b.trie = t
+	b.curr = curr
+	b.datafiles = datafiles
+
+	return nil
 }
 
 // checkAndUpgrade checks if DB upgrade is required
@@ -687,11 +720,13 @@ func (b *Bitcask) Reclaimable() int64 {
 }
 
 func loadDatafiles(path string, maxKeySize uint32, maxValueSize uint64, fileModeBeforeUmask os.FileMode) (datafiles map[int]data.Datafile, lastID int, err error) {
+	// 返回的是有序的fns：[1.data，25.data，38.data，...]
 	fns, err := internal.GetDatafiles(path)
 	if err != nil {
 		return nil, 0, err
 	}
 
+	// 解析出来所有的ids
 	ids, err := internal.ParseIds(fns)
 	if err != nil {
 		return nil, 0, err
@@ -729,15 +764,18 @@ func loadIndex(path string, indexer index.Indexer, maxKeySize uint32, datafiles 
 	if err != nil {
 		return nil, err
 	}
+	// 索引是最新的，就直接返回了
 	if found && indexUpToDate {
 		return t, nil
 	}
+	// 否则的话，索引缺少最新的文件的一部分，需要重新构建下增量索引。
 	if found {
 		if err := loadIndexFromDatafile(t, datafiles[lastID]); err != nil {
 			return nil, err
 		}
 		return t, nil
 	}
+	// 没找到，的话，就得全量更新索引了
 	sortedDatafiles := getSortedDatafiles(datafiles)
 	for _, df := range sortedDatafiles {
 		if err := loadIndexFromDatafile(t, df); err != nil {
@@ -747,8 +785,10 @@ func loadIndex(path string, indexer index.Indexer, maxKeySize uint32, datafiles 
 	return t, nil
 }
 
+// 将最后一个文件的数据也更新到索引中
 func loadIndexFromDatafile(t art.Tree, df data.Datafile) error {
 	var offset int64
+	// 一直读取该wal文件的内容，然后往树里面插入，构建索引
 	for {
 		e, n, err := df.Read()
 		if err != nil {

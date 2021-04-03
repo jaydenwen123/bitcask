@@ -47,6 +47,7 @@ func (i *indexer) Save(t art.Tree, path string) error {
 	}
 	defer f.Close()
 
+	// 写索引
 	if err := writeIndex(t, f); err != nil {
 		return err
 	}

@@ -74,6 +74,7 @@ func NewDatafile(path string, id int, readonly bool, maxKeySize uint32, maxValue
 		return nil, errors.Wrap(err, "error calling Stat()")
 	}
 
+	// mmap映射
 	ra, err = mmap.Open(fn)
 	if err != nil {
 		return nil, err
@@ -81,7 +82,9 @@ func NewDatafile(path string, id int, readonly bool, maxKeySize uint32, maxValue
 
 	offset := stat.Size()
 
+	// 封装了一层reader，然后读数据
 	dec := codec.NewDecoder(r, maxKeySize, maxValueSize)
+	// 封装了一个write，然后写数据
 	enc := codec.NewEncoder(w)
 
 	return &datafile{
@@ -156,8 +159,10 @@ func (df *datafile) ReadAt(index, size int64) (e internal.Entry, err error) {
 	b := make([]byte, size)
 
 	if df.w == nil {
+		// 只读文件
 		n, err = df.ra.ReadAt(b, index)
 	} else {
+		// 否则的话，从r读取
 		n, err = df.r.ReadAt(b, index)
 	}
 	if err != nil {

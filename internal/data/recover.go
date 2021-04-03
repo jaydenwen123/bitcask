@@ -29,6 +29,7 @@ func CheckAndRecover(path string, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("recovering data file")
 	}
+	// 如果恢复了，则把索引文件删除掉，因为索引无法恢复
 	if recovered {
 		if err := os.Remove(filepath.Join(path, "index")); err != nil {
 			return fmt.Errorf("error deleting the index on recovery: %s", err)
@@ -48,6 +49,7 @@ func recoverDatafile(path string, cfg *config.Config) (recovered bool, err error
 			err = closeErr
 		}
 	}()
+	// 打开一个新的恢复文件
 	_, file := filepath.Split(path)
 	rPath := fmt.Sprintf("%s.recovered", file)
 	fr, err := os.OpenFile(rPath, os.O_CREATE|os.O_WRONLY, os.ModePerm)
@@ -65,12 +67,14 @@ func recoverDatafile(path string, cfg *config.Config) (recovered bool, err error
 	enc := codec.NewEncoder(fr)
 	e := internal.Entry{}
 
+	// 没有冲突
 	corrupted := false
 	for !corrupted {
 		_, err = dec.Decode(&e)
 		if err == io.EOF {
 			break
 		}
+		// 找到了冲突的内容，然后就退出
 		if codec.IsCorruptedData(err) {
 			corrupted = true
 			continue
@@ -78,16 +82,20 @@ func recoverDatafile(path string, cfg *config.Config) (recovered bool, err error
 		if err != nil {
 			return false, fmt.Errorf("unexpected error while reading datafile: %w", err)
 		}
+		// 写入到恢复的文件中
 		if _, err := enc.Encode(e); err != nil {
 			return false, fmt.Errorf("writing to recovered datafile: %w", err)
 		}
 	}
+	// 没有冲突，就不需要恢复，然后把恢复文件删除掉
 	if !corrupted {
 		if err := os.Remove(fr.Name()); err != nil {
 			return false, fmt.Errorf("can't remove temporal recovered datafile: %w", err)
 		}
 		return false, nil
 	}
+
+	// 有冲突，将恢复的文件重命名为正确的文件
 	if err := os.Rename(rPath, path); err != nil {
 		return false, fmt.Errorf("removing corrupted file: %s", err)
 	}

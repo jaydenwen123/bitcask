@@ -31,26 +31,29 @@ type Encoder struct {
 // Encode takes any Entry and streams it to the underlying writer.
 // Messages are framed with a key-length and value-length prefix.
 func (e *Encoder) Encode(msg internal.Entry) (int64, error) {
+	// 先写入key的长度、value的长度
 	var bufKeyValue = make([]byte, keySize+valueSize)
 	binary.BigEndian.PutUint32(bufKeyValue[:keySize], uint32(len(msg.Key)))
 	binary.BigEndian.PutUint64(bufKeyValue[keySize:keySize+valueSize], uint64(len(msg.Value)))
 	if _, err := e.w.Write(bufKeyValue); err != nil {
 		return 0, errors.Wrap(err, "failed writing key & value length prefix")
 	}
-
+	// 写key的内容
 	if _, err := e.w.Write(msg.Key); err != nil {
 		return 0, errors.Wrap(err, "failed writing key data")
 	}
+	// 写value的内容
 	if _, err := e.w.Write(msg.Value); err != nil {
 		return 0, errors.Wrap(err, "failed writing value data")
 	}
-
+	// 写校验和
 	bufChecksumSize := bufKeyValue[:checksumSize]
 	binary.BigEndian.PutUint32(bufChecksumSize, msg.Checksum)
 	if _, err := e.w.Write(bufChecksumSize); err != nil {
 		return 0, errors.Wrap(err, "failed writing checksum data")
 	}
 
+	// 写入过期时间
 	bufTTL := bufKeyValue[:ttlSize]
 	if msg.Expiry == nil {
 		binary.BigEndian.PutUint64(bufTTL, uint64(0))
@@ -60,7 +63,7 @@ func (e *Encoder) Encode(msg internal.Entry) (int64, error) {
 	if _, err := e.w.Write(bufTTL); err != nil {
 		return 0, errors.Wrap(err, "failed writing ttl data")
 	}
-
+	// 刷新buffer
 	if err := e.w.Flush(); err != nil {
 		return 0, errors.Wrap(err, "failed flushing data")
 	}

@@ -48,6 +48,7 @@ func GetDatafiles(path string) ([]string, error) {
 
 // ParseIds will parse a list of datafiles as returned by `GetDatafiles` and
 // extract the id part and return a slice of ints.
+// 从文件名解析出id
 func ParseIds(fns []string) ([]int, error) {
 	var ids []int
 	for _, fn := range fns {

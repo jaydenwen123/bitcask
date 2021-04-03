@@ -33,11 +33,13 @@ type Decoder struct {
 }
 
 // Decode decodes the next Entry from the current stream
+// 解码Entry
 func (d *Decoder) Decode(v *internal.Entry) (int64, error) {
 	if v == nil {
 		return 0, errCantDecodeOnNilEntry
 	}
 
+	// 先读key和value的长度
 	prefixBuf := make([]byte, keySize+valueSize)
 
 	_, err := io.ReadFull(d.r, prefixBuf)
@@ -45,16 +47,18 @@ func (d *Decoder) Decode(v *internal.Entry) (int64, error) {
 		return 0, err
 	}
 
+	// 得到真实的keySize和valueSize
 	actualKeySize, actualValueSize, err := getKeyValueSizes(prefixBuf, d.maxKeySize, d.maxValueSize)
 	if err != nil {
 		return 0, err
 	}
 
+	// 然后读取数据
 	buf := make([]byte, uint64(actualKeySize)+actualValueSize+checksumSize+ttlSize)
 	if _, err = io.ReadFull(d.r, buf); err != nil {
 		return 0, errTruncatedData
 	}
-
+	// 读取完后解析，放到v中
 	decodeWithoutPrefix(buf, actualKeySize, v)
 	return int64(keySize + valueSize + uint64(actualKeySize) + actualValueSize + checksumSize + ttlSize), nil
 }
@@ -83,6 +87,7 @@ func getKeyValueSizes(buf []byte, maxKeySize uint32, maxValueSize uint64) (uint3
 	return actualKeySize, actualValueSize, nil
 }
 
+// 将buf中的数据填充到entry中
 func decodeWithoutPrefix(buf []byte, valueOffset uint32, v *internal.Entry) {
 	v.Key = buf[:valueOffset]
 	v.Value = buf[valueOffset : len(buf)-checksumSize-ttlSize]

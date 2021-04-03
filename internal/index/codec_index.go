@@ -33,11 +33,13 @@ func readKeyBytes(r io.Reader, maxKeySize uint32) ([]byte, error) {
 		}
 		return nil, errors.Wrap(errTruncatedKeySize, err.Error())
 	}
+	// 先读长度
 	size := binary.BigEndian.Uint32(s)
 	if maxKeySize > 0 && size > uint32(maxKeySize) {
 		return nil, errKeySizeTooLarge
 	}
 
+	// 再读数据
 	b := make([]byte, size)
 	_, err = io.ReadFull(r, b)
 	if err != nil {
@@ -47,12 +49,14 @@ func readKeyBytes(r io.Reader, maxKeySize uint32) ([]byte, error) {
 }
 
 func writeBytes(b []byte, w io.Writer) error {
+	// 先写长度
 	s := make([]byte, int32Size)
 	binary.BigEndian.PutUint32(s, uint32(len(b)))
 	_, err := w.Write(s)
 	if err != nil {
 		return err
 	}
+	// 再写数据
 	_, err = w.Write(b)
 	if err != nil {
 		return err
@@ -74,6 +78,7 @@ func readItem(r io.Reader) (internal.Item, error) {
 	}, nil
 }
 
+// 这个value，写在哪个文件的哪个位置，长度多少
 func writeItem(item internal.Item, w io.Writer) error {
 	buf := make([]byte, (fileIDSize + offsetSize + sizeSize))
 	binary.BigEndian.PutUint32(buf[:fileIDSize], uint32(item.FileID))
@@ -87,6 +92,7 @@ func writeItem(item internal.Item, w io.Writer) error {
 }
 
 // ReadIndex reads a persisted from a io.Reader into a Tree
+// 构建一棵树
 func readIndex(r io.Reader, t art.Tree, maxKeySize uint32) error {
 	for {
 		key, err := readKeyBytes(r, maxKeySize)
@@ -108,13 +114,16 @@ func readIndex(r io.Reader, t art.Tree, maxKeySize uint32) error {
 	return nil
 }
 
+// 序列化一棵树
 func writeIndex(t art.Tree, w io.Writer) (err error) {
 	t.ForEach(func(node art.Node) bool {
+		// 写key
 		err = writeBytes(node.Key(), w)
 		if err != nil {
 			return false
 		}
 
+		// 写value
 		item := node.Value().(internal.Item)
 		err := writeItem(item, w)
 		return err == nil

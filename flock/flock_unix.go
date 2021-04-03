@@ -22,6 +22,7 @@ func lock_sys(path string, nonBlocking bool) (_ *os.File, err error) {
 		}
 	}()
 
+	// 根据是否非阻塞来设置是获取共享锁还是独占锁
 	flag := unix.LOCK_EX
 	if nonBlocking {
 		flag |= unix.LOCK_NB
